@@ -1,0 +1,733 @@
+%该模型展示了Nagel-Schreckenberg CA模型对4向6相信号交叉口（双向为绿色、黄色、红色）的扩展。
+%在绿灯亮起时允许左转弯和右转弯。在黄色和红色期间也允许右转。低优先级交通流让位给高优先级交通流。
+
+%% 全局模拟参数
+warning off
+global road_length
+global vmax
+global p
+global simulation_steps
+global render
+global verbose
+global green_length
+global yellow_length
+global pause_length
+global north_density
+global south_density
+global east_density
+global west_density
+global north_left_fraction
+global north_right_fraction
+global south_left_fraction
+global south_right_fraction
+global east_left_fraction
+global east_right_fraction
+global west_left_fraction
+global west_right_fraction
+global northbound_occupation_avg
+global southbound_occupation_avg
+global eastbound_occupation_avg
+global westbound_occupation_avg
+global northbound_velocity_avg
+global southbound_velocity_avg
+global eastbound_velocity_avg
+global westbound_velocity_avg
+global northbound_deletion_rate
+global southbound_deletion_rate
+global eastbound_deletion_rate
+global westbound_deletion_rate
+%% 定时参数
+error_count = 0; %用于计算汽车误判的次数。应始终为0-这仅用于调试。
+%生成定时信号
+red_length = green_length + yellow_length + pause_length;
+phaseNS = zeros(1,green_length+yellow_length+red_length+pause_length);
+phaseEW = zeros(1,green_length+yellow_length+red_length+pause_length);
+%NS生成绿色
+phaseNS(1:green_length) = ones(1,green_length);
+%NS生成黄色
+phaseNS(green_length+1:green_length+yellow_length) = 2*ones(1,yellow_length);
+%EW 生成绿色
+phaseEW(green_length+yellow_length+pause_length+1:2*green_length+yellow_length+pause_length) = ones(1,green_length);
+%EW生成黄色
+phaseEW(2*green_length+yellow_length+pause_length+1:2*green_length+2*yellow_length+pause_length) = 2*ones(1,yellow_length);
+%% 生成交叉点
+%使用基于层的模型可以简化几何图形和边界条件的描述。
+%所有的定性差异都表示为不同层的占有率。
+map_size = 2*road_length + 2*vmax + 2; %两侧各有一条道路引道，每侧各有一个vmax长度填料，交叉口宽度为2
+%生成交叉点中心
+%1. 生成中心正方形
+center = zeros(map_size, map_size);
+center(map_size/2:map_size/2+1, map_size/2:map_size/2+1) = 1;
+map_background_grey = 0.5;
+center(1:map_size/2-1, 1:map_size/2-1) = map_background_grey;
+center(map_size/2+2:map_size, 1:map_size/2-1) = map_background_grey;
+center(1:map_size/2-1, map_size/2+2:map_size) = map_background_grey;
+center(map_size/2+2:map_size, map_size/2+2:map_size) = map_background_grey;
+%2. 生成vmax长度填充
+padding = zeros(map_size, map_size);
+%padding = 0.1*ones(map_size, map_size);
+padding(map_size/2 - vmax:map_size/2 - 1,map_size/2+1) = 1;           %南北出口
+padding(map_size/2+2:map_size/2 + 1 + vmax, map_size/2+1) = 1;      %南北走向
+padding(map_size/2 - vmax:map_size/2 - 1,map_size/2) =1;               %南北走向
+padding(map_size/2+2:map_size/2 + 1 + vmax, map_size/2) =1;          %南北出口
+padding(map_size/2,map_size/2 - vmax:map_size/2 - 1) = 1;              %东西出口
+padding(map_size/2,map_size/2+2:map_size/2+1+vmax) = 1;           %东西走向
+padding(map_size/2+1,map_size/2 -vmax:map_size/2 -1) = 1;             %东西走向
+padding(map_size/2+1,map_size/2 +2:map_size/2 +1+ vmax) = 1;        %东西出口
+%生成简单的NaSchr外部通道
+lanes = zeros(map_size, map_size);
+lanes(map_size/2+2+vmax:map_size/2 + 1+ vmax + road_length , map_size/2 + 1) = 1;   %南北走向
+lanes(map_size/2-vmax-road_length:map_size/2 -1 - vmax, map_size/2 +1) = 1;         %南北出口
+lanes(map_size/2-vmax-road_length:map_size/2 -1 - vmax, map_size/2) = 1;            %南北走向
+lanes(map_size/2+2+vmax:map_size/2 + 1+ vmax + road_length , map_size/2) = 1;       %南北出口
+lanes(map_size/2, map_size/2 + 2 + vmax: map_size/2 + 1 + vmax + road_length) = 1;  %东西走向
+lanes(map_size/2+1, map_size/2 + 2 + vmax: map_size/2 + 1 + vmax + road_length) = 1;%东西出口
+lanes(map_size/2+1, map_size/2 - vmax - road_length: map_size/2 - 1 - vmax) = 1;    %东西走向
+lanes(map_size/2, map_size/2 - vmax - road_length: map_size/2 - 1 - vmax) = 1;      %东西出口
+%生成优先级投影层
+high_priority = zeros(map_size, map_size);  %高优先级层：当一辆高优先级车辆在下一个时间步长内占据这些点时，该阵列上的点就会被占用
+%生成转弯决策层
+trajectory_decision = zeros(map_size, map_size);  %交叉口转弯（轨迹）决策-这将是定义预期转弯的12个代码之一：4x3可能性
+%S->N: 1 S->E: 2 S-> W: 3
+%N->S: 4 N->E: 5 N-> W: 6
+%E->N: 7 E->S: 8 E-> W: 9
+%W->N: 10 W->E: 11 W-> S: 12
+northbound_trajectories =  [1 2 3 7 10]; %这些阵列包含指示转弯决策的整数标志（用于轻松检测哪些移动适用于哪些车辆）
+southbound_trajectories =  [4 5 6 8 12];
+eastbound_trajectories = [10 11 12 2 5];
+westbound_trajectories = [7 8 9 3 6];
+left_turn_trajectories = [3 8 4 10];
+right_turn_trajectories = [2 7 6 12];
+straight_through_trajectories = [1 9 4 11];
+trajectory_decision_next = trajectory_decision;
+%生成“自由距离”层
+distance_layer = zeros(map_size,map_size);
+%预分配状态采样阵列。
+%这些用于显示每个车道的一个轴上的时间和另一个轴的方向的2D图。
+%这是通常用于显示NaSchr模拟的图形类型。
+%这可能需要重写，以便在整个运行过程中对系统的整个状态进行采样和记录。
+northbound_occupation = zeros(simulation_steps,map_size);
+southbound_occupation = zeros(simulation_steps,map_size);
+westbound_occupation = zeros(simulation_steps,map_size);
+eastbound_occupation = zeros(simulation_steps,map_size);
+northbound_velocity = zeros(simulation_steps,map_size);
+southbound_velocity = zeros(simulation_steps,map_size);
+westbound_velocity = zeros(simulation_steps,map_size);
+eastbound_velocity = zeros(simulation_steps,map_size);
+occupation_layer = zeros(map_size, map_size); %生成车辆占用层
+velocity_layer = zeros(map_size, map_size);   %生成车辆速度层
+occupation_layer_next = zeros(map_size, map_size);
+velocity_layer_next = zeros(map_size, map_size);
+if render
+    figure
+    hold on
+    h = gcf
+    %set(gcf,'DoubleBuffer','on')
+    %set(h,'erasemode','xor');
+end
+%%迭代
+for n=1:simulation_steps
+%%初始化/清除循环变量
+    initial_count = sum(occupation_layer(:));           %统计所有车辆
+    occupation_layer_next = 0*occupation_layer_next;    %清除临时层变量
+    velocity_layer_next = 0*velocity_layer_next;
+    trajectory_decision_next = 0*trajectory_decision_next;
+    high_priority = 0*high_priority;
+    distance_layer = 0*distance_layer;
+    bf = 0;                                             %将break标志设置为1以退出循环
+%% 在进近处生成新车
+%南行方式
+ if  rand < south_density && occupation_layer(1,map_size/2) == 0
+        initial_count = initial_count + 1;
+         occupation_layer(1,map_size/2) = 1;
+         velocity_layer(1,map_size/2) = round(vmax*rand);
+        turn_rand = rand;
+        if turn_rand < south_left_fraction
+        trajectory_decision(1,map_size/2) = 5;%N->E
+        else
+            if turn_rand < south_left_fraction + south_right_fraction
+                trajectory_decision(1,map_size/2) = 6;%N->W
+            else
+                trajectory_decision(1,map_size/2) = 4;%N->S
+            end
+        end
+ end
+%北行方式
+ if rand < north_density && occupation_layer(map_size,map_size/2+1) == 0
+     initial_count = initial_count + 1;
+         occupation_layer(map_size,map_size/2+1) = 1;
+         velocity_layer(map_size,map_size/2+1) = round(vmax*rand);
+        turn_rand = rand;
+        if turn_rand < north_left_fraction
+        trajectory_decision(map_size,map_size/2+1) = 3;%S->W
+        else
+            if turn_rand < north_left_fraction + north_right_fraction
+                trajectory_decision(map_size,map_size/2+1) = 2;%S->E
+            else
+                trajectory_decision(map_size,map_size/2+1) = 1;%S->N
+            end
+        end
+ end
+%西行方式
+        if rand < west_density  && occupation_layer(map_size/2,map_size) == 0 %不要在交叉口内生成汽车
+            initial_count = initial_count + 1;
+         occupation_layer(map_size/2,map_size) = 1;
+         velocity_layer(map_size/2,map_size) = round(vmax*rand);
+        turn_rand = rand;
+        if turn_rand < west_left_fraction
+        trajectory_decision(map_size/2,map_size) = 8;%E->S
+        else
+            if turn_rand < west_left_fraction + west_right_fraction
+                trajectory_decision(map_size/2,map_size) = 7;%E->N
+            else
+                trajectory_decision(map_size/2,map_size) = 9;%E->W
+            end
+        end
+        end
+%东行方式
+    if rand < east_density && occupation_layer(map_size/2+1,1) == 0 %不要在交叉口内生成汽车
+        initial_count = initial_count + 1;
+         occupation_layer(map_size/2+1,1) = 1;
+         velocity_layer(map_size/2+1,1) = round(vmax*rand);
+        turn_rand = rand;
+        if turn_rand < east_left_fraction
+        trajectory_decision(map_size/2+1,1) = 10;%W->N
+        else
+            if turn_rand < east_left_fraction + east_right_fraction
+                trajectory_decision(map_size/2+1,1) = 12;%W->S
+            else
+                trajectory_decision(map_size/2+1,1) = 11;%W->E
+            end
+        end
+    end
+%% 更新信号相位
+    stageNS = phaseNS(1+mod(n,length(phaseNS)));
+    stageEW = phaseEW(1+mod(n,length(phaseEW)));
+%% 南向高优先级
+        for i=1:map_size%计算高优先级距离
+    if occupation_layer(i, map_size/2) == 1 &&  (trajectory_decision(i,map_size/2) == 4 || trajectory_decision(i,map_size/2) == 5)  && stageNS == 1 %直通或向左绿色：首先计算高优先级路径
+        %向前寻找以找到到下一辆车的距离
+        found_next = 0; %一旦检测到“前方下一辆车”，环路退出标志。需要“完全”脱离循环。
+        distance = vmax + 1;
+        for j=i+1:i+vmax
+                if j <= map_size
+                    entering_intersection = (j >= map_size/2 && i < map_size/2);
+                    intersection_occupied = trajectory_decision(map_size/2+1, map_size/2) == 10 ||  trajectory_decision(map_size/2+1, map_size/2) == 5 || trajectory_decision(map_size/2+1, map_size/2) == 11; %十字路口另一侧的左转或直行车辆
+                    yielding = entering_intersection && intersection_occupied;
+                    if occupation_layer(j, map_size/2) == 1    %NaSchr（避免与前车相撞）
+                        distance = j-i; found_next = 1;
+                    elseif trajectory_decision(i,map_size/2) == 5 && (j >= map_size/2 + 2) %停车左转
+                        distance = j-i; found_next = 1;
+                    elseif yielding
+                        distance = j-i; found_next = 1;
+                    else %未阻止，项目优先级
+                        high_priority(j,map_size/2) = 1;%设置优先级标记以阻止冲突的较低优先级（最高优先级）
+                    end
+                else %实施删除率
+                    if rand > southbound_deletion_rate
+                        distance = map_size - i + 1;
+                    end
+                end
+            if found_next, break, end
+        end
+        distance_layer(i, map_size/2) = distance;
+    end
+        end
+%% 北行高优先级
+        for i=1:map_size%计算高优先级距离
+    if occupation_layer(i, map_size/2+1) == 1 &&  (trajectory_decision(i,map_size/2+1) == 1 || trajectory_decision(i,map_size/2+1) == 3) && stageNS == 1 %直通或向左绿色：首先计算高优先级路径
+        %向前寻找以找到到下一辆车的距离
+        distance = vmax + 1;
+        found_next = 0;%一旦检测到“前方下一辆车”，环路退出标志。需要“完全”脱离循环。
+        for j=i-1:-1:i-vmax
+            if j > 0
+                 entering_intersection = (j <= map_size/2+1 && i > map_size/2 + 1);
+                 intersection_occupied = trajectory_decision(map_size/2, map_size/2+1) == 8 ||  trajectory_decision(map_size/2, map_size/2+1) == 3 ||  trajectory_decision(map_size/2, map_size/2+1) == 9; %十字路口另一侧的左转或直行车辆
+                 yielding = entering_intersection && intersection_occupied;
+            if occupation_layer(j, map_size/2+1) == 1
+                distance = i-j; found_next = 1;
+            elseif yielding
+                distance = i-j; found_next = 1;
+            elseif trajectory_decision(i, map_size/2+1) == 3 &&  (j <= map_size/2-1 ) %左转
+                distance = i-j; found_next = 1;
+            else
+                high_priority(j,map_size/2+1) = 1;%设置优先级标记以阻止冲突的较低优先级（最高优先级）
+            end
+            else %实施删除率
+                if rand > northbound_deletion_rate
+                    distance = i;
+                end
+            end
+            if found_next, break, end
+        end
+        distance_layer(i, map_size/2+1) = distance;
+    end
+        end
+%% 西行高优先级
+        for i=1:map_size%计算高优先级距离
+    if occupation_layer(map_size/2,i) == 1 &&  (trajectory_decision(map_size/2,i) == 9 || trajectory_decision(map_size/2,i) == 8) && stageEW == 1 %直通或向左绿色：首先计算高优先级路径
+        %向前寻找以找到到下一辆车的距离
+        distance = vmax + 1;
+        found_next = 0;%一旦检测到“前方下一辆车”，环路退出标志。需要“完全”脱离循环。
+        for j=i-1:-1:i-vmax
+            if j > 0
+                 entering_intersection = (j <= map_size/2+1 && i > map_size/2 + 1);
+                 intersection_occupied = trajectory_decision(map_size/2, map_size/2) == 4 ||  trajectory_decision(map_size/2, map_size/2) == 8 ||  trajectory_decision(map_size/2, map_size/2) == 5; %十字路口另一侧的左转或直行车辆
+                 yielding = entering_intersection && intersection_occupied;
+            if occupation_layer(map_size/2,j) == 1
+                distance = i-j; found_next = 1;
+            elseif yielding
+                distance = i-j; found_next = 1;
+            elseif trajectory_decision(map_size/2,i) == 8 &&  (j == map_size/2-1) %左转
+                distance = i-j; found_next = 1;
+            else
+                high_priority(map_size/2,j) = 1;%设置优先级标记以阻止冲突的较低优先级（最高优先级）
+            end
+                else %实施删除率
+                if rand > westbound_deletion_rate
+                    distance = i;
+                end
+            end
+            if found_next, break, end
+        end
+        distance_layer(map_size/2,i) = distance;
+    end
+        end
+%% 东行高优先级
+        for i=1:map_size%计算高优先级距离
+    if occupation_layer(map_size/2+1,i) == 1 &&  (trajectory_decision(map_size/2+1,i) == 11 || trajectory_decision(map_size/2+1,i) == 10) && stageEW == 1 %直通或向左绿色：首先计算高优先级路径
+        %向前寻找以找到到下一辆车的距离
+        distance = vmax + 1;
+        found_next = 0;%一旦检测到“前方下一辆车”，环路退出标志。需要“完全”脱离循环。
+        for j=i+1:i+vmax
+            if j <= map_size
+                 entering_intersection = (j >= map_size/2 && i < map_size/2 );
+                 intersection_occupied = trajectory_decision(map_size/2+1, map_size/2+1) == 10 ||  trajectory_decision(map_size/2+1, map_size/2+1) == 1 ||  trajectory_decision(map_size/2+1, map_size/2+1) == 3; %十字路口另一侧的左转或直行车辆
+                 yielding = entering_intersection && intersection_occupied;
+            if occupation_layer(map_size/2+1,j) == 1
+                distance = j-i; found_next = 1;
+            elseif yielding
+                distance = j-i; found_next = 1;
+            elseif trajectory_decision(map_size/2+1,i) == 10 &&  (j >= map_size/2 + 2) %左转
+                distance = j-i; found_next = 1;
+            else
+                  high_priority(map_size/2+1,j) = 1;%设置优先级标记以阻止冲突的较低优先级（最高优先级）
+            end
+                        else %实施删除率
+                if rand > eastbound_deletion_rate
+                    distance = map_size - i + 1;
+                end
+            end
+            if found_next, break, end
+        end
+        distance_layer(map_size/2+1,i) = distance;
+    end
+        end
+%% 南向低优先级
+        for i=1:map_size%计算低优先级距离
+            is_southbound = ismember(trajectory_decision(i,map_size/2),southbound_trajectories);
+            is_lowpriority = ~ismember(trajectory_decision(i,map_size/2),straight_through_trajectories) || ~(stageNS==1);
+            if is_southbound && is_lowpriority %无论是非直行，还是非绿灯，也不包括实际来自其他道路并刚刚通过的车辆，特别是通过但不应受到影响的左转车辆
+                left = trajectory_decision(i,map_size/2) == 5;            %左转
+                straight = trajectory_decision(i,map_size/2) == 4;      %直线行驶
+                right = trajectory_decision(i,map_size/2) == 6;          %向右转弯
+                red_or_yellow = stageNS == 0 || stageNS == 2;        %灯光为黄色或红色
+                at_intersection = i == map_size/2-1;                       %当前处于十字路口
+                waiting_for_red = (left || straight) && red_or_yellow && at_intersection;
+                intersection_occupied = trajectory_decision(map_size/2, map_size/2+1) == 3 ||  trajectory_decision(map_size/2, map_size/2+1) == 9 ||  trajectory_decision(map_size/2, map_size/2+1) == 8; %十字路口9点钟处左转或直行车辆
+                distance = vmax + 1;
+                bf = 0;
+                for j=i+1:i+vmax%向前寻找，找到距离下一个“停止的理由”的距离
+                    if j <= map_size
+                occupied = occupation_layer(j, map_size/2) == 1;
+                priority = (high_priority(j,map_size/2)~=0);
+                entering_intersection = (j >= map_size/2 && i < map_size/2);
+                arriving_at_stop = red_or_yellow && entering_intersection && ~at_intersection;
+                yielding = entering_intersection && intersection_occupied && ~left;
+                turning_left = left && (j >= map_size/2 + 2);
+                turning_right = right && (j >= map_size/2+1);
+                    if occupied || priority || arriving_at_stop || turning_left || turning_right || yielding || waiting_for_red
+                        distance = j-i; bf = 1;
+                    end
+                    else %实施删除率
+                        if rand > southbound_deletion_rate
+                            distance = map_size - i + 1;
+                        end
+                    end
+                    if bf == 1, break, end
+                end
+                if distance_layer(i,map_size/2) < distance %这样可以防止覆盖已计算的高优先级距离。如果未计算距离，则distance _ layer将为0
+                distance_layer(i,map_size/2) = distance;
+                end
+             end
+        end
+%% 北行低优先级
+        for i=1:map_size%计算低优先级距离
+            is_northbound = ismember(trajectory_decision(i,map_size/2+1),northbound_trajectories);
+            is_lowpriority = ~ismember(trajectory_decision(i,map_size/2+1),straight_through_trajectories) || ~(stageNS==1);
+              if is_northbound && is_lowpriority %无论是非直行，还是非绿灯，也不包括实际来自其他道路并刚刚通过的车辆，特别是通过但不应受到影响的左转车辆
+                left = trajectory_decision(i,map_size/2+1) == 3;            %左转
+                straight = trajectory_decision(i,map_size/2+1) == 1;      %直线行驶
+                right = trajectory_decision(i,map_size/2+1) == 2;          %向右转弯
+                red_or_yellow = stageNS == 0 || stageNS == 2;        %灯光为黄色或红色
+                at_intersection = i == map_size/2+2;                       %当前处于十字路口
+                waiting_for_red = (left || straight) && red_or_yellow && at_intersection;
+                intersection_occupied = trajectory_decision(map_size/2+1, map_size/2) == 11 || trajectory_decision(map_size/2+1, map_size/2) == 5 || trajectory_decision(map_size/2+1, map_size/2) == 10; %十字路口9点钟处左转或直行车辆
+                distance = vmax + 1;
+                bf = 0;
+                for j=i-1:-1:i-vmax%向前寻找，找到距离下一个“停止的理由”的距离
+                    if j > 0
+                occupied = occupation_layer(j, map_size/2+1) == 1;
+                priority = (high_priority(j,map_size/2+1)~=0);
+                entering_intersection = (j <= map_size/2+1 && i > map_size/2 + 1);
+                arriving_at_stop = red_or_yellow && entering_intersection && ~at_intersection;
+                yielding = entering_intersection && intersection_occupied && ~left;
+                turning_left = left && (j <= map_size/2-1 );
+                turning_right = right && (j <= map_size/2);
+                    if occupied || priority || arriving_at_stop || turning_left || turning_right || yielding || waiting_for_red
+                        distance = i-j; bf=1;
+                    end
+                        else %实施删除率
+                        if rand > northbound_deletion_rate
+                            distance = i;
+                        end
+                    end
+                    if bf == 1, break, end
+                end
+                if distance_layer(i,map_size/2+1) < distance%这样可以防止覆盖已计算的高优先级距离。如果未计算距离，则distance _ layer将为0
+                distance_layer(i,map_size/2+1) = distance;
+                end
+             end
+        end
+%% 西行低优先级
+        for i=1:map_size%计算低优先级距离
+            is_westbound = ismember(trajectory_decision(map_size/2,i),westbound_trajectories);
+            is_lowpriority = ~ismember(trajectory_decision(map_size/2,i),straight_through_trajectories) || ~(stageEW==1);
+          if is_westbound && is_lowpriority %无论是非直行，还是非绿灯，也不包括实际来自其他道路并刚刚通过的车辆，特别是通过但不应受到影响的左转车辆
+                left = trajectory_decision(map_size/2,i) == 8;            %左转
+                straight = trajectory_decision(map_size/2,i) == 9;      %直线行驶
+                right = trajectory_decision(map_size/2,i) == 7;          %向右转弯
+                red_or_yellow = stageEW == 0 || stageEW == 2;        %灯光为黄色或红色
+                at_intersection = i == map_size/2+2;                       %当前处于十字路口
+                waiting_for_red = (left || straight) && red_or_yellow && at_intersection;
+                intersection_occupied = trajectory_decision(map_size/2+1, map_size/2+1) == 1 || trajectory_decision(map_size/2+1, map_size/2+1) == 10|| trajectory_decision(map_size/2+1, map_size/2+1) == 3; %十字路口9点钟处左转或直行车辆
+                distance = vmax + 1;
+                bf = 0;
+                for j=i-1:-1:i-vmax%向前寻找，找到距离下一个“停止的理由”的距离
+                    if j >0
+                occupied = occupation_layer(map_size/2,j) == 1;
+                priority = (high_priority(map_size/2,j)~=0);
+                entering_intersection = (j <= map_size/2+1 && i > map_size/2 + 1);
+                arriving_at_stop = red_or_yellow && entering_intersection && ~at_intersection;
+                yielding = entering_intersection && intersection_occupied && ~left;
+                turning_left = left && (j == map_size/2-1);
+                turning_right = right && (j <= map_size/2);
+                    if occupied || priority || arriving_at_stop || turning_left || turning_right || yielding || waiting_for_red
+                        distance = i-j; bf=1;
+                    end
+                        else %实施删除率
+                        if rand > westbound_deletion_rate
+                            distance = i;
+                        end
+                    end
+                    if bf == 1, break, end
+                end
+                if distance_layer(map_size/2,i) < distance%这样可以防止覆盖已计算的高优先级距离。如果未计算距离，则distance _ layer将为0
+                distance_layer(map_size/2,i) = distance;
+                end
+          end
+        end
+%% 东行低优先级
+        for i=1:map_size%计算低优先级距离
+        is_eastbound = ismember(trajectory_decision(map_size/2+1,i),eastbound_trajectories);
+        is_lowpriority = ~ismember(trajectory_decision(map_size/2+1,i),straight_through_trajectories) || ~(stageEW==1);
+            if  is_eastbound && is_lowpriority %无论是非直行，还是非绿灯，也不包括实际来自其他道路并刚刚通过的车辆，特别是通过但不应受到影响的左转车辆
+                left = trajectory_decision(map_size/2+1,i) == 10;            %左转
+                straight = trajectory_decision(map_size/2+1,i) == 11;      %直线行驶
+                right = trajectory_decision(map_size/2+1,i) == 12;          %向右转弯
+                red_or_yellow = stageEW == 0 || stageEW == 2;        %灯光为黄色或红色
+                at_intersection = i == map_size/2-1;                       %当前处于十字路口
+                waiting_for_red = (left || straight) && red_or_yellow && at_intersection;
+                intersection_occupied = trajectory_decision(map_size/2, map_size/2) ==  4 || trajectory_decision(map_size/2, map_size/2) == 8 || trajectory_decision(map_size/2, map_size/2) ==  5;%十字路口9点钟处左转或直行车辆
+                distance = vmax + 1;
+                bf = 0;
+                for j=i+1:i+vmax%向前寻找，找到距离下一个“停止的理由”的距离
+                    if j <= map_size
+                occupied = occupation_layer(map_size/2+1,j) == 1;
+                priority = (high_priority(map_size/2+1,j)~=0);
+                entering_intersection = (j >= map_size/2 && i < map_size/2 );
+                arriving_at_stop = red_or_yellow && entering_intersection && ~at_intersection;
+                yielding = entering_intersection && intersection_occupied && ~left;
+                turning_left = left && (j >= map_size/2 + 2);
+                turning_right = right && (j >= map_size/2 + 1);
+                    if occupied || priority || arriving_at_stop || turning_left || turning_right || yielding || waiting_for_red
+                        distance = j-i; bf=1;
+                    end
+                      else %实施删除率
+                        if rand > eastbound_deletion_rate
+                            distance = map_size - i + 1;
+                        end
+                    end
+                    if bf == 1, break, end
+                end
+                if distance_layer(map_size/2+1,i) < distance %这样可以防止覆盖已计算的高优先级距离。如果未计算距离，则distance _ layer将为0
+                distance_layer(map_size/2+1,i) = distance;
+                end
+             end
+        end
+%% 南向运动
+        for i=1:map_size
+            if occupation_layer(i,map_size/2)==1 && ismember(trajectory_decision(i,map_size/2),southbound_trajectories)
+                distance = distance_layer(i,map_size/2);
+       %1.加快
+        if velocity_layer(i,map_size/2) < vmax && distance > velocity_layer(i,map_size/2)+1
+            velocity_layer(i,map_size/2) = velocity_layer(i,map_size/2)+1;
+        end
+        %2. 制动
+        if distance <= velocity_layer(i,map_size/2)
+            if distance > 0
+            velocity_layer(i,map_size/2) = distance -1;
+            else
+                velocity_layer(i,map_size/2) = 0;
+            end
+        end
+        %3. 随机化
+        if rand < p && velocity_layer(i,map_size/2) > 0
+        velocity_layer(i,map_size/2) = velocity_layer(i,map_size/2) -1;
+        end
+        %4. 运动
+        if i+velocity_layer(i,map_size/2) <= map_size && ~(i== map_size/2 && trajectory_decision(i,map_size/2) == 6) && ~(i== map_size/2+1 && trajectory_decision(i,map_size/2) == 5) %如果没有出界，没有右转，也没有左转
+        occupation_layer_next(i+velocity_layer(i,map_size/2),map_size/2) = 1;
+        velocity_layer_next(i+velocity_layer(i,map_size/2),map_size/2) = velocity_layer(i,map_size/2);
+        trajectory_decision_next(i+velocity_layer(i,map_size/2),map_size/2) = trajectory_decision(i,map_size/2);
+        if occupation_layer(i+velocity_layer(i,map_size/2),map_size/2) == 1 && velocity_layer(i,map_size/2) ~= 0%碰撞检测
+            disp('Southbound crash at:')
+            disp('Victim:')
+            [i+velocity_layer(i,map_size/2) map_size/2]
+            trajectory_decision(i+velocity_layer(i,map_size/2), map_size/2)
+            disp('Fault:')
+            [i map_size/2]
+            trajectory_decision(i, map_size/2)
+            disp('Velocity:')
+            velocity_layer(i, map_size/2)
+            disp('Headway:')
+            distance_layer(i, map_size/2)
+            disp('stageNS:')
+            stageNS
+            disp('stageEW:')
+            stageEW
+        %    bf = 1;
+        end
+        elseif i+velocity_layer(i,map_size/2) > map_size
+                initial_count = initial_count - 1;
+        end
+            end
+        end
+%% 北上运动
+        for i=1:map_size
+            if occupation_layer(i,map_size/2+1) == 1 && ismember(trajectory_decision(i,map_size/2+1),northbound_trajectories)
+        distance = distance_layer(i,map_size/2+1);
+        %1.  加快
+        if velocity_layer(i,map_size/2+1) < vmax && distance > velocity_layer(i,map_size/2+1)+1
+            velocity_layer(i,map_size/2+1) = velocity_layer(i,map_size/2+1)+1;
+        end
+        %2. 制动
+        if distance <= velocity_layer(i,map_size/2+1)
+            if distance > 0
+            velocity_layer(i,map_size/2+1) = distance -1;
+            else
+                velocity_layer(i,map_size/2+1) = 0;
+            end
+        end
+        %3. 随机化
+        if rand < p && velocity_layer(i,map_size/2+1) > 0
+        velocity_layer(i,map_size/2+1) = velocity_layer(i,map_size/2+1) -1;
+        end
+        %4. 运动
+        if  i-velocity_layer(i,map_size/2+1) > 0 && ~(i== map_size/2 && trajectory_decision(i,map_size/2+1) == 3) && ~(i== map_size/2+1 && trajectory_decision(i,map_size/2+1) == 2)
+        occupation_layer_next(i-velocity_layer(i,map_size/2+1),map_size/2+1) = 1;
+        velocity_layer_next(i-velocity_layer(i,map_size/2+1),map_size/2+1) = velocity_layer(i,map_size/2+1);
+        trajectory_decision_next(i-velocity_layer(i,map_size/2+1),map_size/2+1) = trajectory_decision(i,map_size/2+1);
+        if occupation_layer(i-velocity_layer(i,map_size/2+1),map_size/2+1) == 1 && velocity_layer(i,map_size/2+1) ~= 0%碰撞检测
+            disp('Northbound crash')
+            disp('Victim:')
+            [i-velocity_layer(i,map_size/2+1) map_size/2+1]
+            trajectory_decision(i-velocity_layer(i,map_size/2+1), map_size/2+1)
+            disp('Fault:')
+            [i map_size/2+1]
+            trajectory_decision(i, map_size/2+1)
+            disp('Velocity:')
+            velocity_layer(i, map_size/2+1)
+            disp('Headway:')
+            distance_layer(i, map_size/2+1)
+            disp('stageNS:')
+            stageNS
+            disp('stageEW:')
+            stageEW
+        %    bf = 1;
+        end
+        elseif i-velocity_layer(i,map_size/2+1) <= 0
+            initial_count = initial_count - 1;
+        end
+           end
+        end
+%% 西行运动
+        for i=1:map_size
+            if occupation_layer(map_size/2,i) == 1 && ismember(trajectory_decision(map_size/2,i),westbound_trajectories)
+                distance = distance_layer(map_size/2,i);
+       %1. 加快
+        if velocity_layer(map_size/2,i) < vmax && distance > velocity_layer(map_size/2,i)+1
+            velocity_layer(map_size/2,i) = velocity_layer(map_size/2,i)+1;
+        end
+        %2. 制动
+        if distance <= velocity_layer(map_size/2,i)
+            if distance > 0
+            velocity_layer(map_size/2,i) = distance -1;
+            else
+                velocity_layer(map_size/2,i) = 0;
+            end
+        end
+        %3.  随机化
+        if rand < p && velocity_layer(map_size/2,i) > 0
+        velocity_layer(map_size/2,i) = velocity_layer(map_size/2,i) -1;
+        end
+        %4. 运动
+        if  i-velocity_layer(map_size/2,i) > 0 && ~(i == map_size/2 && trajectory_decision(map_size/2,i) == 8) && ~ (i== map_size/2+1 && trajectory_decision(map_size/2,i) == 7)
+        occupation_layer_next(map_size/2,i-velocity_layer(map_size/2,i)) = 1;
+        velocity_layer_next(map_size/2,i-velocity_layer(map_size/2,i)) = velocity_layer(map_size/2,i);
+        trajectory_decision_next(map_size/2,i-velocity_layer(map_size/2,i)) = trajectory_decision(map_size/2,i);
+        if occupation_layer(map_size/2,i-velocity_layer(map_size/2,i)) == 1  && velocity_layer(map_size/2,i) ~= 0%碰撞检测
+            disp('Westbound crash')
+            disp('Victim:')
+            [map_size/2 i-velocity_layer(map_size/2,i)]
+            trajectory_decision(map_size/2, i-velocity_layer(map_size/2,i))
+            disp('Fault:')
+            [map_size/2 i]
+            trajectory_decision(map_size/2, i)
+            disp('Velocity:')
+            velocity_layer(map_size/2, i)
+            disp('Headway:')
+            distance_layer(map_size/2, i)
+            disp('stageNS:')
+            stageNS
+            disp('stageEW:')
+            stageEW
+           % bf = 1;
+        end
+        elseif  i-velocity_layer(map_size/2,i) <= 0
+            initial_count = initial_count - 1;
+        end
+           end
+        end
+%% 东行运动
+        for i=1:map_size
+            if occupation_layer(map_size/2+1,i) == 1 && ismember(trajectory_decision(map_size/2+1,i),eastbound_trajectories)
+                distance = distance_layer(map_size/2+1,i);
+       %1. 加快
+        if velocity_layer(map_size/2+1,i) < vmax && distance > velocity_layer(map_size/2+1,i)+1
+            velocity_layer(map_size/2+1,i) = velocity_layer(map_size/2+1,i)+1;
+        end
+        %2.制动
+        if distance <= velocity_layer(map_size/2+1,i)
+            if distance > 0
+            velocity_layer(map_size/2+1,i) = distance -1;
+            else
+                velocity_layer(map_size/2+1,i) = 0;
+            end
+        end
+        %3. 随机化
+        if rand < p && velocity_layer(map_size/2+1,i) > 0
+        velocity_layer(map_size/2+1,i) = velocity_layer(map_size/2+1,i) -1;
+        end
+        %4. 运动
+        if  i+velocity_layer(map_size/2+1,i) <= map_size && ~(i== map_size/2 && trajectory_decision(map_size/2+1,i) == 12) && ~(i== map_size/2+1 && trajectory_decision(map_size/2+1,i) == 10)
+        occupation_layer_next(map_size/2+1,i+velocity_layer(map_size/2+1,i)) = 1;
+        velocity_layer_next(map_size/2+1,i+velocity_layer(map_size/2+1,i)) = velocity_layer(map_size/2+1,i);
+        trajectory_decision_next(map_size/2+1,i+velocity_layer(map_size/2+1,i)) = trajectory_decision(map_size/2+1,i);
+        if occupation_layer(map_size/2+1,i+velocity_layer(map_size/2+1,i)) == 1  && velocity_layer(map_size/2+1,i) ~= 0 %碰撞检测
+            disp('Eastbound crash')
+            disp('Victim:')
+           [map_size/2+1 i+velocity_layer(map_size/2+1,i)]
+           trajectory_decision(map_size/2+1, i+velocity_layer(map_size/2+1,i))
+           disp('Fault:')
+           [map_size/2+1 i]
+           trajectory_decision(map_size/2+1, i)
+           disp('Velocity:')
+           velocity_layer(map_size/2+1,i)
+           disp('Headway:')
+            distance_layer(map_size/2+1,i)
+           disp('stageNS:')
+            stageNS
+            disp('stageEW:')
+            stageEW
+          %  bf = 1;
+        end
+        elseif i+velocity_layer(map_size/2+1,i) > map_size
+            initial_count = initial_count - 1;
+        end
+           end
+        end
+%% 更新和状态，执行检查，采样。
+    %更新状态
+    occupied_layer_last = occupation_layer;
+    occupation_layer = occupation_layer_next;
+    velocity_layer_last = velocity_layer;
+    velocity_layer = velocity_layer_next;
+    trajectory_decision_last = trajectory_decision;
+    trajectory_decision = trajectory_decision_next;
+    if verbose
+    %重新计算所有车辆的数量-检查是否存在差异
+    %还需要考虑创建和销毁的车辆，因此在代码中创建或销毁车辆的早期点，initial_count会增加或减少
+    final_count  = sum(occupation_layer(:)); %更新后的车辆计数
+    if initial_count ~= final_count %简单的碰撞检测-这会错过不在同一地点降落的高速车辆的碰撞
+        warning('Collision detected')
+        initial_count
+        final_count
+        error_count = error_count+1;
+        bf = 1;
+    end
+    end
+    %样本占用状态
+    northbound_occupation(n,:) = occupation_layer(:,map_size/2+1)';
+    southbound_occupation(n,:) = occupation_layer(:,map_size/2)';
+    westbound_occupation(n,:) = occupation_layer(map_size/2,:);
+    eastbound_occupation(n,:) = occupation_layer(map_size/2+1,:);
+    %样本速度状态
+    northbound_velocity(n,:) = velocity_layer(:,map_size/2+1)';
+    southbound_velocity(n,:) = velocity_layer(:,map_size/2)';
+    westbound_velocity(n,:) = velocity_layer(map_size/2,:);
+    eastbound_velocity(n,:) = velocity_layer(map_size/2+1,:);
+    northbound_occupation_avg = northbound_occupation_avg + sum(northbound_occupation(:))/(simulation_steps*length(northbound_occupation(:)));
+    southbound_occupation_avg = southbound_occupation_avg + sum(southbound_occupation(:))/(simulation_steps*length(southbound_occupation(:)));
+    eastbound_occupation_avg = eastbound_occupation_avg + sum(eastbound_occupation(:))/(simulation_steps*length(eastbound_occupation(:)));
+    westbound_occupation_avg = westbound_occupation_avg + sum(westbound_occupation(:))/(simulation_steps*length(westbound_occupation(:)));
+    if sum(northbound_occupation(:)) > 0
+    northbound_velocity_avg = northbound_velocity_avg + sum(northbound_velocity(:))/(simulation_steps*sum(northbound_occupation(:)));
+    end
+    if sum(southbound_occupation(:)) > 0
+    southbound_velocity_avg = southbound_velocity_avg + sum(southbound_velocity(:))/(simulation_steps*sum(southbound_occupation(:)));
+    end
+    if sum(eastbound_occupation(:)) > 0
+    eastbound_velocity_avg = eastbound_velocity_avg + sum(eastbound_velocity(:))/(simulation_steps*sum(eastbound_occupation(:)));
+    end
+    if sum(westbound_occupation(:)) > 0
+    westbound_velocity_avg = westbound_velocity_avg + sum(westbound_velocity(:))/(simulation_steps*sum(westbound_occupation(:)));
+    end
+    if render
+    clf
+    h = imshow(lanes+center+padding-occupation_layer, 'InitialMagnification', 'fit');
+    %set(gcf,'DoubleBuffer','on')
+    %set(h,'erasemode','xor');
+    %screen_size = get(0, 'ScreenSize');
+    %f1 = figure(1);
+    %set(f1, 'Position', [0 0 screen_size(3) screen_size(4) ] );
+    pause(0.01)
+    drawnow
+    end
+
+    if testing
+        waitforbuttonpress
+    end
+%  if bf == 1, break, end
+end
+
